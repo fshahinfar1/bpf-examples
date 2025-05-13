@@ -437,7 +437,8 @@ struct port_params {
 };
 
 struct shareable_rings {
-	pthread_spinlock_t lock;
+	pthread_spinlock_t fq_lock;
+	pthread_spinlock_t cq_lock;
 	struct xsk_ring_prod _umem_fq;
 	struct xsk_ring_cons _umem_cq;
 	int _umem_fq_initialized;
@@ -530,7 +531,8 @@ port_init(struct port_params *params)
 	}
 
 	p->r = calloc(sizeof(struct shareable_rings), 1);
-	pthread_spin_init(&p->r->lock, 0);
+	pthread_spin_init(&p->r->fq_lock, 0);
+	pthread_spin_init(&p->r->cq_lock, 0);
 	if (!p->r) {
 		port_free(p);
 		return NULL;
@@ -615,7 +617,7 @@ port_rx_burst(struct port *p, struct burst_rx *b)
 	p->n_pkts_rx += n_pkts;
 
 	/* UMEM FQ. */
-	pthread_spin_lock(&p->r->lock);
+	pthread_spin_lock(&p->r->fq_lock);
 	for ( ; ; ) {
 		int status;
 
@@ -638,7 +640,7 @@ port_rx_burst(struct port *p, struct burst_rx *b)
 			bcache_cons(p->bc);
 
 	xsk_ring_prod__submit(&p->umem_fq, n_pkts);
-	pthread_spin_unlock(&p->r->lock);
+	pthread_spin_unlock(&p->r->fq_lock);
 
 	return n_pkts;
 }
@@ -650,7 +652,7 @@ port_tx_burst(struct port *p, struct burst_tx *b)
 	int status;
 
 	/* UMEM CQ. */
-	pthread_spin_lock(&p->r->lock);
+	pthread_spin_lock(&p->r->cq_lock);
 	n_pkts = p->params.bp->umem_cfg.comp_size;
 
 	n_pkts = xsk_ring_cons__peek(&p->umem_cq, n_pkts, &pos);
@@ -662,7 +664,7 @@ port_tx_burst(struct port *p, struct burst_tx *b)
 	}
 
 	xsk_ring_cons__release(&p->umem_cq, n_pkts);
-	pthread_spin_unlock(&p->r->lock);
+	pthread_spin_unlock(&p->r->cq_lock);
 
 	/* TXQ. */
 	n_pkts = b->n_pkts;
@@ -697,6 +699,8 @@ port_tx_burst(struct port *p, struct burst_tx *b)
 #define MAX_PORTS_PER_THREAD 16
 #endif
 
+static u64 delay = 0;
+
 struct thread_data {
 	struct port *ports_rx[MAX_PORTS_PER_THREAD];
 	struct port *ports_tx[MAX_PORTS_PER_THREAD];
@@ -706,6 +710,26 @@ struct thread_data {
 	u32 cpu_core_id;
 	int quit;
 };
+
+u64 fib(u32 limit)
+{
+	u64 a = 1, b = 1 , c = 0;
+	for (__u32 i = 2; i < limit; i++) {
+		c = a + b;
+		a = b;
+		b = c;
+	}
+	return b;
+}
+
+static inline void do_some_pkt_processing(void *data, u32 len)
+{
+	if (delay == 0) return;
+	u64 f = fib(delay);
+	if (f == 4) {
+		printf("this should be impossible\n");
+	}
+}
 
 static void swap_mac_addresses(void *data)
 {
@@ -748,6 +772,7 @@ thread_func(void *arg)
 			u8 *pkt = xsk_umem__get_data(port_rx->params.bp->addr,
 						     addr);
 
+			do_some_pkt_processing(pkt, brx->len[j]);
 			swap_mac_addresses(pkt);
 
 			btx->addr[btx->n_pkts] = brx->addr[j];
@@ -834,6 +859,8 @@ print_usage(char *prog_name)
 		"               (INTERFACE, QUEUE) pair specified one\n"
 		"               forwarding port. Default: %u. May be invoked\n"
 		"               multiple times.\n"
+		"-d DELAY       Calculate the given fibonacci number as proxy\n"
+		"			for processing a packet.\n"
 		"-x XDP-PROG    Load the XDP program\n"
 		"\n";
 	printf(usage,
@@ -852,7 +879,7 @@ parse_args(int argc, char **argv)
 
 	/* Parse the input arguments. */
 	for ( ; ;) {
-		opt = getopt_long(argc, argv, "b:c:i:q:x:", lgopts, &option_index);
+		opt = getopt_long(argc, argv, "b:c:d:i:q:x:", lgopts, &option_index);
 		if (opt == EOF)
 			break;
 
@@ -871,7 +898,9 @@ parse_args(int argc, char **argv)
 			thread_data[n_threads].cpu_core_id = atoi(optarg);
 			n_threads++;
 			break;
-
+		case 'd':
+			sscanf(optarg, "%llu", &delay);
+			break;
 		case 'i':
 			if (n_ports == MAX_PORTS) {
 				printf("Max number of ports (%d) reached.\n",
@@ -1220,7 +1249,7 @@ int main(int argc, char **argv)
 
 	if (load_xdp_prog) {
 		for (i = 0; i < MAX_PORTS; i++)
-			port_params[i].xsk_cfg.libxdp_flags = 
+			port_params[i].xsk_cfg.libxdp_flags =
 				XSK_LIBXDP_FLAGS__INHIBIT_PROG_LOAD;
 	}
 

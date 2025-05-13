@@ -30,20 +30,21 @@ SEC("xdp_sock") int xdp_sock_prog(struct xdp_md *ctx)
 	void *data_end = (void *)(__u64)ctx->data_end;
 	struct ethhdr *eth = data;
 	struct iphdr *ip = (struct iphdr *)(eth + 1);
-	struct udphdr *udp = (struct udphdr *)(ip + 1);
-	if ((void *)(udp + 1) > data_end)
+	// struct udphdr *udp = (struct udphdr *)(ip + 1);
+	if ((void *)(ip + 1) > data_end)
 		return XDP_PASS;
 	if (eth->h_proto != bpf_ntohs(ETH_P_IP))
 		return XDP_PASS;
 	if (ip->protocol != IPPROTO_UDP)
 		return XDP_PASS;
-	rr = (rr + 1) & (num_socks - 1);
+	// rr = (rr + 1) & (num_socks - 1);
+	rr = (rr + 1) % (num_socks);
 	int ret =  bpf_redirect_map(&xsks_map, rr, XDP_DROP);
-	if (ret == XDP_DROP) {
-		bpf_printk("failed to redirect %d / %d", rr, num_socks);
-	} else {
-		// bpf_printk("to %d", rr);
-	}
+	// if (ret == XDP_DROP) {
+	// 	bpf_printk("failed to redirect %d / %d", rr, num_socks);
+	// } else {
+	// 	// bpf_printk("to %d", rr);
+	// }
 	return ret;
 }
 
