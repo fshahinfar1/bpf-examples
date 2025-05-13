@@ -18,6 +18,7 @@
 #include <getopt.h>
 #include <netinet/ether.h>
 #include <net/if.h>
+#include <assert.h>
 
 #include <linux/err.h>
 #include <linux/if_link.h>
@@ -435,6 +436,14 @@ struct port_params {
 	u32 iface_queue;
 };
 
+struct shareable_rings {
+	pthread_spinlock_t lock;
+	struct xsk_ring_prod _umem_fq;
+	struct xsk_ring_cons _umem_cq;
+	int _umem_fq_initialized;
+	u32 refs;
+};
+
 struct port {
 	struct port_params params;
 
@@ -442,14 +451,34 @@ struct port {
 
 	struct xsk_ring_cons rxq;
 	struct xsk_ring_prod txq;
-	struct xsk_ring_prod umem_fq;
-	struct xsk_ring_cons umem_cq;
+	struct shareable_rings *r;
 	struct xsk_socket *xsk;
-	int umem_fq_initialized;
+
+#define umem_fq r->_umem_fq
+#define umem_cq r->_umem_cq
+#define umem_fq_initialized r->_umem_fq_initialized
 
 	u64 n_pkts_rx;
 	u64 n_pkts_tx;
 };
+
+#ifndef MAX_PORTS
+#define MAX_PORTS 64
+#endif
+
+static struct port_params port_params[MAX_PORTS];
+static struct port *ports[MAX_PORTS];
+static u64 n_pkts_rx[MAX_PORTS];
+static u64 n_pkts_tx[MAX_PORTS];
+static int n_ports;
+
+static bool
+is_same_iface_qid_pair(struct port *port_a, struct port *port_b)
+{
+	if (port_a->params.iface_queue != port_b->params.iface_queue)
+		return false;
+	return strcmp(port_a->params.iface, port_b->params.iface) == 0;
+}
 
 static void
 port_free(struct port *p)
@@ -466,6 +495,12 @@ port_free(struct port *p)
 		xsk_socket__delete(p->xsk);
 
 	bcache_free(p->bc);
+
+	/* if (p->r) { */
+	/* 	p->r->refs--; */
+	/* 	if (p->r->refs == 0) */
+	/* 		free(p->r); */
+	/* } */
 
 	free(p);
 }
@@ -494,6 +529,13 @@ port_init(struct port_params *params)
 		return NULL;
 	}
 
+	p->r = calloc(sizeof(struct shareable_rings), 1);
+	pthread_spin_init(&p->r->lock, 0);
+	if (!p->r) {
+		port_free(p);
+		return NULL;
+	}
+
 	/* xsk socket. */
 	status = xsk_socket__create_shared(&p->xsk,
 					   params->iface,
@@ -507,6 +549,22 @@ port_init(struct port_params *params)
 	if (status) {
 		port_free(p);
 		return NULL;
+	}
+
+	// check if we have another socket on the same interface-queue (port)
+	for (u32 i = 0; i < n_ports; i++) {
+		struct port *other = ports[i];
+		if (!other)
+			continue;
+		if (other->umem_fq_initialized == 0)
+			continue; // is not initialized yet
+		if (!is_same_iface_qid_pair(other, p))
+			continue; // is not same iface-queue pair
+		// oh, we have bound on this queue before:
+		free(p->r);
+		p->r = other->r;
+		p->r->refs++;
+		return p; // we are done
 	}
 
 	/* umem fq. */
@@ -557,6 +615,7 @@ port_rx_burst(struct port *p, struct burst_rx *b)
 	p->n_pkts_rx += n_pkts;
 
 	/* UMEM FQ. */
+	pthread_spin_lock(&p->r->lock);
 	for ( ; ; ) {
 		int status;
 
@@ -579,6 +638,7 @@ port_rx_burst(struct port *p, struct burst_rx *b)
 			bcache_cons(p->bc);
 
 	xsk_ring_prod__submit(&p->umem_fq, n_pkts);
+	pthread_spin_unlock(&p->r->lock);
 
 	return n_pkts;
 }
@@ -590,6 +650,7 @@ port_tx_burst(struct port *p, struct burst_tx *b)
 	int status;
 
 	/* UMEM CQ. */
+	pthread_spin_lock(&p->r->lock);
 	n_pkts = p->params.bp->umem_cfg.comp_size;
 
 	n_pkts = xsk_ring_cons__peek(&p->umem_cq, n_pkts, &pos);
@@ -601,6 +662,7 @@ port_tx_burst(struct port *p, struct burst_tx *b)
 	}
 
 	xsk_ring_cons__release(&p->umem_cq, n_pkts);
+	pthread_spin_unlock(&p->r->lock);
 
 	/* TXQ. */
 	n_pkts = b->n_pkts;
@@ -736,10 +798,6 @@ static const struct port_params port_params_default = {
 	.iface_queue = 0,
 };
 
-#ifndef MAX_PORTS
-#define MAX_PORTS 64
-#endif
-
 #ifndef MAX_THREADS
 #define MAX_THREADS 64
 #endif
@@ -748,15 +806,12 @@ static struct bpool_params bpool_params;
 static struct xsk_umem_config umem_cfg;
 static struct bpool *bp;
 
-static struct port_params port_params[MAX_PORTS];
-static struct port *ports[MAX_PORTS];
-static u64 n_pkts_rx[MAX_PORTS];
-static u64 n_pkts_tx[MAX_PORTS];
-static int n_ports;
-
 static pthread_t threads[MAX_THREADS];
 static struct thread_data thread_data[MAX_THREADS];
 static int n_threads;
+
+static bool load_xdp_prog = false;
+static char *custom_prog_path = NULL;
 
 static void
 print_usage(char *prog_name)
@@ -779,6 +834,7 @@ print_usage(char *prog_name)
 		"               (INTERFACE, QUEUE) pair specified one\n"
 		"               forwarding port. Default: %u. May be invoked\n"
 		"               multiple times.\n"
+		"-x XDP-PROG    Load the XDP program\n"
 		"\n";
 	printf(usage,
 	       prog_name,
@@ -796,7 +852,7 @@ parse_args(int argc, char **argv)
 
 	/* Parse the input arguments. */
 	for ( ; ;) {
-		opt = getopt_long(argc, argv, "c:i:q:", lgopts, &option_index);
+		opt = getopt_long(argc, argv, "b:c:i:q:x:", lgopts, &option_index);
 		if (opt == EOF)
 			break;
 
@@ -834,6 +890,11 @@ parse_args(int argc, char **argv)
 				return -1;
 			}
 			port_params[n_ports - 1].iface_queue = atoi(optarg);
+			break;
+
+		case 'x':
+			load_xdp_prog = true;
+			custom_prog_path = strdup(optarg);
 			break;
 
 		default:
@@ -965,13 +1026,20 @@ signal_handler(int sig)
 	quit = 1;
 }
 
+#define STRERR_BUFSIZE          1024
+static enum xdp_attach_mode opt_attach_mode = XDP_MODE_NATIVE;
+static struct xdp_program *xdp_prog = NULL;
 static void remove_xdp_program(void)
 {
 	struct xdp_multiprog *mp;
 	int i, err;
 
+
 	for (i = 0 ; i < n_ports; i++) {
-	        mp = xdp_multiprog__get_from_ifindex(if_nametoindex(port_params[i].iface));
+		int ifindex = if_nametoindex(port_params[i].iface);
+		bpf_xdp_attach(ifindex, -1, opt_attach_mode, NULL);
+
+	        mp = xdp_multiprog__get_from_ifindex(ifindex);
 	        if (IS_ERR_OR_NULL(mp)) {
 	        	printf("No XDP program loaded on %s\n", port_params[i].iface);
 	        	continue;
@@ -983,17 +1051,164 @@ static void remove_xdp_program(void)
 	}
 }
 
+static void load_xdp_program(void)
+{
+	char errmsg[STRERR_BUFSIZE];
+	int err;
+	
+	if (custom_prog_path == NULL) {
+		fprintf(stderr, "internal error, the xdp program path is not set\n");
+		exit(EXIT_FAILURE);
+	}
+
+	xdp_prog = xdp_program__open_file(custom_prog_path, NULL, NULL);
+	err = libxdp_get_error(xdp_prog);
+	if (err) {
+		libxdp_strerror(err, errmsg, sizeof(errmsg));
+		fprintf(stderr, "ERROR: program loading failed: %s\n", errmsg);
+		exit(EXIT_FAILURE);
+	}
+}
+
+static void attach_xdp_program(void)
+{
+	char errmsg[STRERR_BUFSIZE];
+	assert (xdp_prog != NULL);
+	for (u32 i = 0; i < n_ports; i++) {
+		bool duplicate = false;
+		for (u32 j = 0; j < i; j++) {
+			if (strcmp(ports[i]->params.iface, ports[j]->params.iface) == 0) {
+				duplicate = true;
+				break;
+			}
+		}
+		if (duplicate)
+			continue;
+		// attach xdp to this interface
+		int ifindex = if_nametoindex(ports[i]->params.iface);
+		if (ifindex  < 0) {
+			fprintf(stderr, "failed to get interface fd for %s\n", ports[i]->params.iface);
+			remove_xdp_program();
+			exit(EXIT_FAILURE);
+		}
+		int err = xdp_program__attach(xdp_prog, ifindex, opt_attach_mode, 0);
+		if (err) {
+			libxdp_strerror(err, errmsg, sizeof(errmsg));
+			fprintf(stderr, "ERROR: attaching program failed: %s\n", errmsg);
+			remove_xdp_program();
+			exit(EXIT_FAILURE);
+		}
+		printf("Attaching XDP to %s\n", ports[i]->params.iface);
+	}
+}
+
+static int lookup_bpf_map(int prog_fd)
+{
+	__u32 i, *map_ids, num_maps, prog_len = sizeof(struct bpf_prog_info);
+	__u32 map_len = sizeof(struct bpf_map_info);
+	struct bpf_prog_info prog_info = {};
+	int fd, err, xsks_map_fd = -ENOENT;
+	struct bpf_map_info map_info;
+
+	err = bpf_obj_get_info_by_fd(prog_fd, &prog_info, &prog_len);
+	if (err)
+		return err;
+
+	num_maps = prog_info.nr_map_ids;
+
+	map_ids = calloc(prog_info.nr_map_ids, sizeof(*map_ids));
+	if (!map_ids)
+		return -ENOMEM;
+
+	memset(&prog_info, 0, prog_len);
+	prog_info.nr_map_ids = num_maps;
+	prog_info.map_ids = (__u64)(unsigned long)map_ids;
+
+	err = bpf_obj_get_info_by_fd(prog_fd, &prog_info, &prog_len);
+	if (err) {
+		free(map_ids);
+		return err;
+	}
+
+	for (i = 0; i < prog_info.nr_map_ids; i++) {
+		fd = bpf_map_get_fd_by_id(map_ids[i]);
+		if (fd < 0)
+			continue;
+
+		memset(&map_info, 0, map_len);
+		err = bpf_obj_get_info_by_fd(fd, &map_info, &map_len);
+		if (err) {
+			close(fd);
+			continue;
+		}
+
+		if (!strncmp(map_info.name, "xsks_map", sizeof(map_info.name)) &&
+		    map_info.key_size == 4 && map_info.value_size == 4) {
+			xsks_map_fd = fd;
+			break;
+		}
+
+		close(fd);
+	}
+
+	free(map_ids);
+	return xsks_map_fd;
+}
+
+static void insert_sockets(void)
+{
+	struct bpf_map *data_map;
+	int i, xsks_map;
+	int key = 0;
+
+	data_map = bpf_object__find_map_by_name(xdp_program__bpf_obj(xdp_prog), ".bss");
+	if (!data_map || !bpf_map__is_internal(data_map)) {
+		fprintf(stderr, "ERROR: bss map found!\n");
+		remove_xdp_program();
+		exit(EXIT_FAILURE);
+	}
+	if (bpf_map_update_elem(bpf_map__fd(data_map), &key, &n_ports, BPF_ANY)) {
+		fprintf(stderr, "ERROR: bpf_map_update_elem num_socks %d!\n", n_ports);
+		remove_xdp_program();
+		exit(EXIT_FAILURE);
+	}
+	xsks_map = lookup_bpf_map(xdp_program__fd(xdp_prog));
+	if (xsks_map < 0) {
+		fprintf(stderr, "ERROR: no xsks map found: %s\n",
+			strerror(xsks_map));
+			remove_xdp_program();
+			exit(EXIT_FAILURE);
+	}
+
+	for (i = 0; i < n_ports; i++) {
+		struct port *p = ports[i];
+		int fd = xsk_socket__fd(p->xsk);
+		int ret;
+
+		key = i;
+		ret = bpf_map_update_elem(xsks_map, &key, &fd, 0);
+		if (ret) {
+			fprintf(stderr, "ERROR: bpf_map_update_elem %d\n", i);
+			remove_xdp_program();
+			exit(EXIT_FAILURE);
+		}
+	}
+}
+
 int main(int argc, char **argv)
 {
 	struct timespec time;
 	u64 ns0;
 	int i;
 
+	remove_xdp_program();
+
 	/* Parse args. */
 	memcpy(&bpool_params, &bpool_params_default,
 	       sizeof(struct bpool_params));
 	memcpy(&umem_cfg, &umem_cfg_default,
 	       sizeof(struct xsk_umem_config));
+
 	for (i = 0; i < MAX_PORTS; i++)
 		memcpy(&port_params[i], &port_params_default,
 		       sizeof(struct port_params));
@@ -1002,6 +1217,13 @@ int main(int argc, char **argv)
 		print_usage(argv[0]);
 		return -1;
 	}
+
+	if (load_xdp_prog) {
+		for (i = 0; i < MAX_PORTS; i++)
+			port_params[i].xsk_cfg.libxdp_flags = 
+				XSK_LIBXDP_FLAGS__INHIBIT_PROG_LOAD;
+	}
+
 
 	/* Buffer pool initialization. */
 	bp = bpool_init(&bpool_params, &umem_cfg);
@@ -1024,6 +1246,13 @@ int main(int argc, char **argv)
 		print_port(i);
 	}
 	printf("All ports created successfully.\n");
+
+	if (load_xdp_prog) {
+		printf("Loading custom XDP program\n");
+		load_xdp_program();
+		attach_xdp_program();
+		insert_sockets();
+	}
 
 	/* Threads. */
 	for (i = 0; i < n_threads; i++) {
