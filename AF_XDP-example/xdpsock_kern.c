@@ -3,6 +3,12 @@
 #include <bpf/bpf_helpers.h>
 #include "xdpsock.h"
 
+#include <bpf/bpf_endian.h>
+#include <linux/in.h>
+#include <linux/if_ether.h>
+#include <linux/ip.h>
+#include <linux/udp.h>
+
 /* This XDP program is only needed for multi-buffer and XDP_SHARED_UMEM modes.
  * If you do not use these modes, libbpf can supply an XDP program for you.
  */
@@ -15,10 +21,30 @@ struct {
 } xsks_map SEC(".maps");
 
 int num_socks = 0;
-static unsigned int rr;
+// static unsigned int rr;
 
 SEC("xdp_sock") int xdp_sock_prog(struct xdp_md *ctx)
 {
-	rr = (rr + 1) & (num_socks - 1);
-	return bpf_redirect_map(&xsks_map, rr, XDP_DROP);
+	// send only the udp traffic to AF_XDP
+	void *data = (void *)(__u64)ctx->data;
+	void *data_end = (void *)(__u64)ctx->data_end;
+	struct ethhdr *eth = data;
+	struct iphdr *ip = eth + 1;
+	struct udphdr *udp = ip + 1;
+	if (udp + 1 > data_end)
+		return XDP_PASS;
+	if (eth->h_proto != bpf_ntohs(ETH_P_IP))
+		return XDP_PASS;
+	if (ip->protocol != IPPROTO_UDP)
+		return XDP_PASS;
+	int zero = 0;
+	int ret = bpf_redirect_map(&xsks_map, zero, XDP_DROP);
+	if (ret == XDP_DROP) {
+		bpf_printk("failed to redirect");
+	}
+	return ret;
+	// rr = (rr + 1) & (num_socks - 1);
+	// return bpf_redirect_map(&xsks_map, rr, XDP_DROP);
 }
+
+char  _license[] SEC("license") = "GPL";

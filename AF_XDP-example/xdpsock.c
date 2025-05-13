@@ -145,6 +145,7 @@ static bool opt_tstamp;
 static struct xdp_program *xdp_prog;
 static bool opt_frags;
 static bool load_xdp_prog;
+static char *custom_prog_path = NULL;
 
 struct vlan_ethhdr {
 	unsigned char h_dest[6];
@@ -1081,6 +1082,7 @@ static struct xsk_socket_info *xsk_configure_socket(struct xsk_umem_info *umem,
 	return xsk;
 }
 
+#define PARAM_XDP 25
 static struct option long_options[] = {
 	{"rxdrop", no_argument, 0, 'r'},
 	{"txonly", no_argument, 0, 't'},
@@ -1120,6 +1122,7 @@ static struct option long_options[] = {
 	{"irq-string", no_argument, 0, 'I'},
 	{"busy-poll", no_argument, 0, 'B'},
 	{"reduce-cap", no_argument, 0, 'R'},
+	{"xdp", required_argument, 0, PARAM_XDP},
 	{0, 0, 0, 0}
 };
 
@@ -1171,6 +1174,7 @@ static void usage(const char *prog)
 		"  -B, --busy-poll      Busy poll.\n"
 		"  -R, --reduce-cap	Use reduced capabilities (cannot be used with -M)\n"
 		"  -F, --frags		Enable frags (multi-buffer) support\n"
+		"  --xdp		 	Load custom xdp program\n"
 		"\n";
 	fprintf(stderr, str, prog, XSK_UMEM__DEFAULT_FRAME_SIZE,
 		opt_batch_size, MIN_PKT_SIZE, MIN_PKT_SIZE,
@@ -1348,6 +1352,11 @@ static void parse_command_line(int argc, char **argv)
 		case 'F':
 			opt_frags = true;
 			break;
+		case PARAM_XDP:
+			printf("using a custom xdp program\n");
+			load_xdp_prog = true;
+			custom_prog_path = strdup(optarg);
+			break;
 		default:
 			usage(basename(argv[0]));
 		}
@@ -1371,7 +1380,7 @@ static void parse_command_line(int argc, char **argv)
 		fprintf(stderr, "ERROR: -M and -R cannot be used together\n");
 		usage(basename(argv[0]));
 	}
-	load_xdp_prog = (opt_num_xsks > 1 || opt_frags);
+	load_xdp_prog = (load_xdp_prog || opt_num_xsks > 1 || opt_frags);
 	if (opt_frags)
 		opt_xdp_bind_flags |= XDP_USE_SG;
 }
@@ -1813,7 +1822,8 @@ static void load_xdp_program(void)
 	char errmsg[STRERR_BUFSIZE];
 	int err;
 
-	xdp_prog = xdp_program__open_file("xdpsock_kern.o", NULL, NULL);
+	char *path = custom_prog_path == NULL ? "xdpsock_kern.o" : custom_prog_path;
+	xdp_prog = xdp_program__open_file(path, NULL, NULL);
 	err = libxdp_get_error(xdp_prog);
 	if (err) {
 		libxdp_strerror(err, errmsg, sizeof(errmsg));
