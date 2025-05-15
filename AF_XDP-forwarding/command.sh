@@ -4,17 +4,25 @@
 
 
 mode=single_queue
-cores=( 2 4 6 8 10 )
+cores=( 12 14 16 18 20 )
 max_cores=${#cores[@]}
 
 num_cores=1
 delay=0
 xdp_prog=./xdpsock_kern.o # xdp program to load
 qid=0 # queue to attach to
+base_port=8080
+
+usage() {
+	printf "Usage: $0\n"
+	printf "  -c --cores: (default: 1) number of cores to use\n"
+	printf "  -d --delay: (defalut: 0) packet processing cost\n"
+	printf "  -m --multi: (defalut: false) run multi-queue experiment with aRFS\n"
+}
 
 while [ $# -gt 0 ]; do
 	key=$1
-	case $key in 
+	case $key in
 		-c|--cores)
 			num_cores=$2
 			shift
@@ -25,12 +33,36 @@ while [ $# -gt 0 ]; do
 			shift
 			shift
 			;;
+		-m|--multi)
+			mode=multi_queue
+			shift;
+			;;
+		-h|--help)
+			usage
+			shift
+			exit 0
+			;;
 		*)
-			echo "Unexpected argument"
+			usage
+			echo "Unexpected argument ($key)"
 			exit 1
 			;;
 	esac
 done
+
+configure_flow_steering_rules() {
+	sudo ethtool -K $NET_IFACE ntuple-filters on
+	old_rules=( $(sudo ethtool -u $NET_IFACE | grep Filter | cut -d ' ' -f 2) )
+	for r in ${old_rules[@]}; do
+		sudo ethtool -U $NET_IFACE delete $r
+	done
+	sudo ethtool -X $NET_IFACE equal $num_cores
+	for i in $( seq 0 $((num_cores-1)) ); do
+		target=$((base_port + i))
+		sudo ethtool -U $NET_IFACE flow-type udp4 dst-port $target action $i
+	done
+	echo "configure queue to core pinning yourself :) (if needed)"
+}
 
 echo "Runing experiment: $mode with $num_cores workers"
 case $mode in
@@ -40,6 +72,16 @@ case $mode in
 			arg_cores="$arg_cores -i $NET_IFACE -q $qid -c ${cores[$i]}"
 		done
 		cmd="sudo ./xsk_fwd -b 131072 -x $xdp_prog $arg_cores -d $delay"
+		echo $cmd
+		$cmd
+		;;
+	multi_queue)
+		configure_flow_steering_rules
+		arg_cores=""
+		for i in $(seq 0 $((num_cores-1)) );do
+			arg_cores="$arg_cores -i $NET_IFACE -q $i -c ${cores[$i]}"
+		done
+		cmd="sudo ./xsk_fwd -b 131072 $arg_cores -d $delay"
 		echo $cmd
 		$cmd
 		;;
