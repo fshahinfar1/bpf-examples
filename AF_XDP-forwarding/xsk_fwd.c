@@ -531,12 +531,12 @@ port_init(struct port_params *params)
 	}
 
 	p->r = calloc(sizeof(struct shareable_rings), 1);
-	pthread_spin_init(&p->r->fq_lock, 0);
-	pthread_spin_init(&p->r->cq_lock, 0);
 	if (!p->r) {
 		port_free(p);
 		return NULL;
 	}
+	pthread_spin_init(&p->r->fq_lock, 0);
+	pthread_spin_init(&p->r->cq_lock, 0);
 
 	/* xsk socket. */
 	status = xsk_socket__create_shared(&p->xsk,
@@ -566,6 +566,7 @@ port_init(struct port_params *params)
 		free(p->r);
 		p->r = other->r;
 		p->r->refs++;
+		printf("reusing a shared Fill queue/Completion queue\n");
 		return p; // we are done
 	}
 

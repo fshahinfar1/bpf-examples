@@ -13,6 +13,8 @@ xdp_prog=./xdpsock_kern.o # xdp program to load
 qid=0 # queue to attach to
 base_port=8080
 
+HAS_BPFTOOL=1
+
 usage() {
 	printf "Usage: $0\n"
 	printf "  -c --cores: (default: 1) number of cores to use\n"
@@ -50,12 +52,16 @@ while [ $# -gt 0 ]; do
 	esac
 done
 
-configure_flow_steering_rules() {
+remove_all_rules() {
 	sudo ethtool -K $NET_IFACE ntuple-filters on
 	old_rules=( $(sudo ethtool -u $NET_IFACE | grep Filter | cut -d ' ' -f 2) )
 	for r in ${old_rules[@]}; do
 		sudo ethtool -U $NET_IFACE delete $r
 	done
+}
+
+configure_flow_steering_rules() {
+	remove_all_rules
 	sudo ethtool -X $NET_IFACE equal $num_cores
 	for i in $( seq 0 $((num_cores-1)) ); do
 		target=$((base_port + i))
@@ -67,6 +73,11 @@ configure_flow_steering_rules() {
 echo "Runing experiment: $mode with $num_cores workers"
 case $mode in
 	single_queue)
+		if [ $HAS_BPFTOOL -eq 1 ]; then
+			sudo bpftool net detach xdp dev $NET_IFACE
+		fi
+		remove_all_rules
+		sudo ethtool -X $NET_IFACE equal 1
 		arg_cores=""
 		for i in $(seq 0 $((num_cores-1)) );do
 			arg_cores="$arg_cores -i $NET_IFACE -q $qid -c ${cores[$i]}"
